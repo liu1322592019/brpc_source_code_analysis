@@ -25,7 +25,7 @@ void foo(int a, int b) {
 
 执行到foo函数中的执行点1时，线程A的栈帧如下图所示：
 
-<img src="../images/bthread_basis_1.png" width="20%" height="20%"/>
+<img src="../images/bthread_basis_1.png"/>
 
 线程A从bar()函数返回，执行到执行点2时，先销毁bar()函数的形参m，再销毁bar()的栈帧，从foo()函数返回后，先销毁局部变量c，接着销毁形参b、a，最后销毁foo()的栈帧。
 
@@ -36,7 +36,7 @@ void foo(int a, int b) {
 有了yield和resume这两个原语，可以实现pthread线程执行流在不同函数间的跳转，只需要将函数作为协程的任务函数即可。一个线程执行一个协程A的任务处理函数taskFunc_A时，如果想要去执行另一个协程B的任务处理函数taskFunc_B，不必等到taskFunc_A执行到return语句，可以在taskFunc_A内执行一个yield语句，然后线程执行流可以从taskFunc_A中跳出，去执行taskFunc_B。如果想让taskFunc_A恢复执行，则调用一个resume语句，让taskFunc_A从yield语句的返回点处开始继续执行，并且taskFunc_A的执行结果不受yield的影响。
 
 ## 协程的原理与实现方式
-协程有三个组成要素：一个任务函数，一个存储寄存器状态的结构，一个私有栈空间（通常是malloc分配的一块内存，或者static静态区的一块内存）。
+协程有三个组成要素：`一个任务函数`，`一个存储寄存器状态的结构`，`一个私有栈空间`（通常是malloc分配的一块内存，或者static静态区的一块内存）。
 
 协程被称作用户级线程就是因为协程有其私有的栈空间，pthread系统线程调用一个普通函数时，函数的栈帧、形参、局部变量都分配在pthread线程的栈上，而pthread执行一个协程的任务函数时，协程任务函数的栈帧、形参、局部变量都分配在协程的私有栈上。
 
@@ -48,14 +48,15 @@ yield和resume有多种实现方式，可以使用posix的ucontext，boost的fco
    typedef struct ucontext
    {
      unsigned long int uc_flags;
-     // uc_link指向的ucontext是后继协程的ucontext，当前协程的任务函数return后，会自动将后继协程
-     // 的ucontext缓存的寄存器值加载到cpu的寄存器中，cpu会去执行后继协程的任务函数（可能是从函数
-     // 入口点开始执行，也可能是从函数yield调用的返回点恢复执行）。
-     struct ucontext *uc_link;  
-     // 协程私有栈。                             
-     stack_t uc_stack;
-     // uc_mcontext结构用于缓存协程yield时，cpu各个寄存器的当前值。
-     mcontext_t uc_mcontext;
+     /*
+      * uc_link指向的ucontext是后继协程的ucontext
+      * 当前协程的任务函数return后，会自动将后继协程的ucontext缓存的寄存器值加载到cpu的寄存器中
+      * cpu会去执行后继协程的任务函数
+      * 可能是从函数入口点开始执行，也可能是从函数yield调用的返回点恢复执行
+      * */
+     struct ucontext *uc_link;              
+     stack_t uc_stack; // 协程私有栈
+     mcontext_t uc_mcontext; // 用于缓存协程yield时，cpu各个寄存器的当前值
      __sigset_t uc_sigmask;
    } ucontext_t;
    ```
@@ -64,28 +65,33 @@ yield和resume有多种实现方式，可以使用posix的ucontext，boost的fco
 
    - int getcontext(ucontext_t *ucp)
    
-     将cpu的各个寄存器的当前值存入当前正在被cpu执行的协程A的ucontext_t的uc_mcontext结构中。重要的寄存器有栈底指针寄存器、栈顶指针寄存器、协程A的任务函数下一条将被执行的语句的指令指针寄存器等。
+     - 将cpu的各个寄存器的当前值存入当前正在被cpu执行的协程A的ucontext_t的uc_mcontext结构中。
+     - 重要的寄存器有栈底指针寄存器、栈顶指针寄存器、协程A的任务函数下一条将被执行的语句的指令指针寄存器等。
    
    - int setcontext(const ucontext_t *ucp)
    
-     将一个协程A的ucontext_t的uc_mcontext结构中缓存的各种寄存器的值加载到cpu的寄存器中，cpu可以根据栈底指针寄存器、栈顶指针寄存器定位到该协程A的私有栈空间，根据指令指针寄存器定位到协程A的任务函数的执行点（可能为函数入口点也可能为函数yield调用的返回点），从而cpu可以去执行协程A的任务函数，并将函数执行过程中产生的局部变量等分配在协程A的私有栈上。
+     - 将一个协程A的ucontext_t的uc_mcontext结构中缓存的各种寄存器的值加载到cpu的寄存器中。
+     - cpu可以根据栈底指针寄存器、栈顶指针寄存器定位到该协程A的私有栈空间，根据指令指针寄存器定位到协程A的任务函数的执行点（可能为函数入口点也可能为函数yield调用的返回点），从而cpu可以去执行协程A的任务函数，并将函数执行过程中产生的局部变量等分配在协程A的私有栈上。
    
    - void makecontext(ucontext_t *ucp, void (*func)(), int argc, ...)
    
-     指定一个协程的任务函数func以及func的argc等参数。
+     - 指定一个协程的任务函数func以及func的argc等参数。
    
    - int swapcontext(ucontext_t *oucp, ucontext_t *ucp)
    
-     相当于getcontext(oucp) + setcontext(ucp)的原子调用，将cpu寄存器的当前值存入oucp指向的ucontext_t的uc_mcontext结构中，并将ucp指向的ucontext_t的uc_mcontext结构中缓存的寄存器值加载到cpu的寄存器上，目的是让当前协程yield，让ucp对应的协程start或resume。
+     - 相当于getcontext(oucp) + setcontext(ucp)的原子调用
+     - 将cpu寄存器的当前值存入oucp指向的ucontext_t的uc_mcontext结构中，并将ucp指向的ucontext_t的uc_mcontext结构中缓存的寄存器值加载到cpu的寄存器上，目的是让当前协程yield，让ucp对应的协程start或resume。
 
 用ucontext实现的一个协程的内存布局如下图所示：
 
-<img src="../images/bthread_basis_2.png" width="25%" height="25%"/>
+<img src="../images/bthread_basis_2.png"/>
 
 ## 系统线程执行多个协程时的内存布局变化过程
 下面通过一个协程示例程序，展现pthread系统线程执行多个协程时的内存变化过程：
 
 ```c++
+#include <ucontext.h>
+
 static ucontext_t ctx[3];
 
 static void func_1(void) {
@@ -121,7 +127,7 @@ int main(int argc, char **argv) {
   // 也就是pthread线程从main函数之前的yield调用的返回处继续执行。
   ctx[1].uc_link = &ctx[0];
   // 指定协程1的任务函数为func_1。
-  makecontext(&ctx[1], func1, 0);
+  makecontext(&ctx[1], func_1, 0);
 
   // 初始化协程2的ucontext_t结构ctx[2]。
   getcontext(&ctx[2]);
@@ -143,11 +149,11 @@ int main(int argc, char **argv) {
 
 在上述程序中，pthread系统线程执行到main函数的执行点1时，内存布局如下图所示，协程1和协程2的私有栈内存是main函数的局部变量，均分配在执行main函数的pthread的线程栈上。并且此时还未执行到swapcontext(&ctx[0], &ctx[2])，所以ctx[0]内的值都是空的：
 
-<img src="../images/bthread_basis_3.png" width="75%" height="75%"/>
+<img src="../images/bthread_basis_3.png"/>
 
 pthread执行了main函数中的swapcontext(&ctx[0], &ctx[2])后，main函数（也可以认为是一个协程）yield，pthread开始执行协程2的任务函数func_2，在func_2中执行swapcontext(&ctx[2], &ctx[1])后，协程2 yield，pthread开始执行协程1的任务函数func_1，pthread执行到func_1内的执行点2时，内存布局如下图所示，此时main函数和协程2都已被挂起，ctx[0]存储了pthread线程栈的基底地址和栈顶地址，以及main函数执行点5处代码的地址，ctx[2]存储了stack_2的基底地址和栈顶地址，以及func_2函数执行点3处代码的地址，协程1正在被执行过程中，没有被挂起，所以ctx[1]相比之前没有变化：
 
-<img src="../images/bthread_basis_4.png" width="75%" height="75%"/>
+<img src="../images/bthread_basis_4.png"/>
 
 pthread执行func_1中的swapcontext(&ctx[1], &ctx[2])后，协程1被挂起，ctx[1]存储了stack_1的基底地址和栈顶地址，以及func_1函数执行点4处代码的地址，pthread转去执行协程2的任务函数的下一条代码，也就是协程2被resume，从func_2函数的执行点3处恢复执行，接着func_2就return了，由于ctx[2].uc_link = &ctx[1]，pthread再次转去执行协程1的任务函数的下一条代码，协程1被resume，从func_1函数的执行点4处恢复执行，再接着func_1函数return，又由于ctx[1].uc_link = &ctx[0]，pthread又去执行main函数的下一条代码，main函数被resume，从执行点5处恢复恢复执行，至此协程1和协程2都执行完毕，main函数也将要return了。这个过程可以称作main函数、协程1、协程2分别在一个pthread线程上被调度执行。
 
