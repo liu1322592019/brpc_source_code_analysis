@@ -24,11 +24,14 @@
     }
     ```
 
-   spinlock属于应用层的同步机制，直接运行在用户态，不涉及用户态-内核态的切换。spinlock存在的问题是，只适用于需要线程加锁的临界区代码段较小的场景，在这样的场景下可以认为一个线程加了锁后很快就会释放锁，等待锁的其他线程只需要很少的while()调用就可以得到锁；但如果临界区代码很长，一个线程加锁后会耗费相当一段时间去执行临界区代码，在这个线程释放锁之前其他线程只能不停地在while()中不断busy-loop，耗费了cpu资源，而且在应用程序层面又没有办法能让pthread系统线程挂起。
+   spinlock属于应用层的同步机制，直接运行在用户态，不涉及用户态-内核态的切换。spinlock存在的问题是，只适用于**需要线程加锁的临界区代码段较小的场景**，在这样的场景下可以认为一个线程加了锁后很快就会释放锁，等待锁的其他线程只需要很少的while()调用就可以得到锁；但如果临界区代码很长，一个线程加锁后会耗费相当一段时间去执行临界区代码，在这个线程释放锁之前其他线程只能不停地在while()中不断busy-loop，耗费了cpu资源，而且在应用程序层面又没有办法能让pthread系统线程挂起。
 
 2. 直接使用Linux提供的pthread_mutex_lock系统调用或者编程语言提供的操作互斥锁的API（如C++的std::unique_lock），本质上是一样的，都是使用Linux内核提供的同步机制，可以让pthread系统线程挂起，让出CPU。但缺点是如果直接使用Linux内核提供的同步机制，每一次lock、unlock操作都是一次系统调用，需要进行用户态-内核态的切换，存在一定的性能开销，但lock、unlock的时候不一定会有线程间的竞争，在没有线程竞争的情况下没有必要进行用户态-内核态的切换。
 
 ## Futex设计原理
+
+**可以理解为先自旋在等待让出cpu，默认前提是竞争很少，轻易不进行系统调用**。
+
 Futex机制可以认为是结合了spinlock和内核态的pthread线程锁，它的设计意图是：
 
 1. 一个线程在加锁的时候，在用户态使用原子操作执行“尝试加锁，如果当前锁变量值为0，则将锁变量值更新为1，返回成功；如果当前锁变量值为1，说明之前已有线程拿到了锁，返回失败”这个动作，如果加锁成功，则可直接去执行临界区代码；如果加锁失败，则用类似pthread_mutex_lock这样的系统调用将当前线程挂起。由于可能有多个线程同时被挂起，所以必须将各个被挂起线程的信息存入一个与锁相关的等待队列中；
@@ -47,10 +50,12 @@ Futex机制可以认为是结合了spinlock和内核态的pthread线程锁，它
    }
    ```
    
-   这样的实现存在一个问题，在trylock()和wait()间存在一个时间窗口，在这个时间窗口中锁变量可能发生改变。比如一个线程A调用trylock()返回失败，在调用wait()前，锁被之前持有锁的线程B释放，线程A再调用wait()就会被永久挂起，永远不会再被唤醒了。因此需要在wait()内部再次判断锁变量是否仍为在trylock()内看到的旧值，如果不是，则wait()应直接返回，再次去执行trylock()。
+   这样的实现存在一个问题，在trylock()和wait()间存在一个时间窗口，在这个时间窗口中锁变量可能发生改变。比如一个线程A调用trylock()返回失败，在调用wait()前，锁被之前持有锁的线程B释放，线程A再调用wait()就会被永久挂起，永远不会再被唤醒了。因此**需要在wait()内部再次判断锁变量是否仍为在trylock()内看到的旧值**，如果不是，则wait()应直接返回，再次去执行trylock()。
 
-## brpc中Futex的实现
-brpc实现了Futex机制，主要代码在src/bthread/sys_futex.cpp中，SimuFutex类定义了一个锁的等待队列计数等统计量，另外有两个函数分别负责wait和wake：
+## brpc中MacOS系统下的Futex的实现
+主要代码在`src/bthread/sys_futex.cpp`中，SimuFutex类定义了一个锁的等待队列计数等统计量，另外有两个函数分别负责wait和wake：
+
+实现futex的其实是[pthread_cond_timedwait](#https://zhuanlan.zhihu.com/p/537864266)
 
 - SimuFutex类：
 
@@ -70,9 +75,8 @@ public:
 public:
     pthread_mutex_t lock;
     pthread_cond_t cond;
-    // 有多少个线程在等待一个锁的时候被挂起。
-    int32_t counts;
-    int32_t ref;
+    int32_t counts; // 有多少个线程在等待一个锁的时候被挂起。
+    int32_t ref;    // 有多少个线程在操作它, 引用计数
 };
 ```
 
@@ -119,6 +123,7 @@ int futex_wait_private(void* addr1, int expected, const timespec* timeout) {
             --simu_futex.counts;
         } else {
             // 锁*addr1的当前最新值与expected期望值不等，需要再次执行上层的spinlock。
+            // 见上文, brpc中Futex的实现.4
             errno = EAGAIN;
             rc = -1;
         }
@@ -174,4 +179,31 @@ int futex_wake_private(void* addr1, int nwake) {
     mu2.unlock();
     return nwakedup;
 }
+```
+## linux内核中Futex的实现
+
+- 调用链(`kernel\futex\syscalls.c`) `futex` -> `do_futex`
+
+可以参考[知乎](#https://zhuanlan.zhihu.com/p/537864266)
+
+```c++
+int futex_wait_setup(u32 __user *uaddr, u32 val, unsigned int flags,
+		     struct futex_q *q, struct futex_hash_bucket **hb)
+{
+    u32 uval;
+    get_futex_key(uaddr, flags & FLAGS_SHARED, &q->key, FUTEX_READ);
+
+    futex_q_lock(q); // 获得自旋锁，且是一直持有的，直到进入等待状态
+
+    futex_get_value_locked(&uval, uaddr);
+
+    if (uval != val) {
+        // 值变了， 直接返回
+        futex_q_unlock(*hb);
+        ret = -EWOULDBLOCK;
+    }
+
+    return ret;
+}
+
 ```
