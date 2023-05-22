@@ -27,21 +27,21 @@
 
 2. ResourcePool是模板类，模板参数是对象类型，主要的成员变量：
 
-   - _local_pool：一个ResourcePool单例上，每个线程有各自私有的LocalPool对象，_local_pool是私有LocalPool对象的指针。LocalPool类的成员有：
+   - `_local_pool`：一个ResourcePool单例上，每个线程有各自私有的LocalPool对象，_local_pool是私有LocalPool对象的指针。LocalPool类的成员有：
    
-     - _cur_block：从ResourcePool单例的全局内存区申请到的一块Block的指针。
+     - `_cur_block`：从ResourcePool单例的全局内存区申请到的一块Block的指针。
      
-     - _cur_block_index：_cur_block指向的Block在ResourcePool单例的全局内存区中的Block索引号。
+     - `_cur_block_index`：_cur_block指向的Block在ResourcePool单例的全局内存区中的Block索引号。
      
-     - _cur_free：LocalPool对象中未存满被回收对象id的空闲对象列表。
+     - `_cur_free`：LocalPool对象中未存满被回收对象id的空闲对象列表。
    
-   - _nlocal：一个ResourcePool单例上，LocalPool对象的数量。
+   - `_nlocal`：一个ResourcePool单例上，LocalPool对象的数量。
    
-   - _block_groups：一个ResourcePool单例上，BlockGroup指针的数组。一个BlockGroup中含有RP_GROUP_NBLOCK个Block的指针。一个Block中含有若干个对象。
+   - `_block_groups`：一个ResourcePool单例上，BlockGroup指针的数组。一个BlockGroup中含有RP_GROUP_NBLOCK个Block的指针。一个Block中含有若干个对象。
    
-   - _ngroup：一个ResourcePool单例上，BlockGroup的数量。
+   - `_ngroup`：一个ResourcePool单例上，BlockGroup的数量。
    
-   - _free_chunks：一个ResourcePool单例上，已经存满被回收对象id的空闲列表的队列。
+   - `_free_chunks`：一个ResourcePool单例上，已经存满被回收对象id的空闲列表的队列。
    
 一个ResourcePool对象的内存布局如下图表示：
 
