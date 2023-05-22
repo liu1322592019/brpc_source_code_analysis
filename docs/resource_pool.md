@@ -37,7 +37,7 @@
    
    - `_nlocal`：一个ResourcePool单例上，LocalPool对象的数量。
    
-   - `_block_groups`：一个ResourcePool单例上，BlockGroup指针的数组。一个BlockGroup中含有RP_GROUP_NBLOCK个Block的指针。一个Block中含有若干个对象。
+   - `_block_groups`：一个ResourcePool单例上，BlockGroup指针的数组。一个BlockGroup中含有RP_GROUP_NBLOCK个Block的指针。一个Block中含有若干个对象。(**实际存储的地方**)
    
    - `_ngroup`：一个ResourcePool单例上，BlockGroup的数量。
    
@@ -45,7 +45,7 @@
    
 一个ResourcePool对象的内存布局如下图表示：
 
-TODO
+<img src="../images/resource_pool.png"/>
 
 ## ResourcePool的源码解析
 为对象分配内存和回收内存的主要代码都在ResourcePool类中。
@@ -122,7 +122,7 @@ TODO
             return p;                                                   \
         }                                                               \
         /* Fetch a Block from global */                                 \
-        // 线程私有的Block已用满，再从该类型对象的全局内存区中再申请一块Block。
+        // 线程私有的Block已用满，再从该类型对象的全局内存区中再申请一块Block
         _cur_block = add_block(&_cur_block_index);                      \
         if (_cur_block != NULL) {                                       \
             id->value = _cur_block_index * BLOCK_NITEM + _cur_block->nitem; \
@@ -150,32 +150,7 @@ TODO
     }
    ```
   
-   ResourcePool::add_block_group()函数作用是新建一个BlockGroup并加入ResourcePool单例的_block_groups数组：
-  
-   ```c++
-    static bool add_block_group(size_t old_ngroup) {
-        BlockGroup* bg = NULL;
-        BAIDU_SCOPED_LOCK(_block_group_mutex);
-        const size_t ngroup = _ngroup.load(butil::memory_order_acquire);
-        if (ngroup != old_ngroup) {
-            // Other thread got lock and added group before this thread.
-            return true;
-        }
-        if (ngroup < RP_MAX_BLOCK_NGROUP) {
-            bg = new(std::nothrow) BlockGroup;
-            if (NULL != bg) {
-                // Release fence is paired with consume fence in address() and
-                // add_block() to avoid un-constructed bg to be seen by other
-                // threads.
-                _block_groups[ngroup].store(bg, butil::memory_order_release);
-                _ngroup.store(ngroup + 1, butil::memory_order_release);
-            }
-        }
-        return bg != NULL;
-    }
-   ```
-  
-   ResourcePool::add_block()函数作用是新建一个Block并将Block的地址加入当前未满的BlockGroup的blocks数组：
+     ResourcePool::add_block()函数作用是新建一个Block并将Block的地址加入当前未满的BlockGroup的blocks数组：
   
    ```c++
     static Block* add_block(size_t* index) {
@@ -205,6 +180,31 @@ TODO
         // Fail to add_block_group.
         delete new_block;
         return NULL;
+    }
+   ```
+
+   ResourcePool::add_block_group()函数作用是新建一个BlockGroup并加入ResourcePool单例的_block_groups数组：
+  
+   ```c++
+    static bool add_block_group(size_t old_ngroup) {
+        BlockGroup* bg = NULL;
+        BAIDU_SCOPED_LOCK(_block_group_mutex);
+        const size_t ngroup = _ngroup.load(butil::memory_order_acquire);
+        if (ngroup != old_ngroup) {
+            // Other thread got lock and added group before this thread.
+            return true;
+        }
+        if (ngroup < RP_MAX_BLOCK_NGROUP) {
+            bg = new(std::nothrow) BlockGroup;
+            if (NULL != bg) {
+                // Release fence is paired with consume fence in address() and
+                // add_block() to avoid un-constructed bg to be seen by other
+                // threads.
+                _block_groups[ngroup].store(bg, butil::memory_order_release);
+                _ngroup.store(ngroup + 1, butil::memory_order_release);
+            }
+        }
+        return bg != NULL;
     }
    ```
   

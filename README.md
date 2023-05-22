@@ -5,7 +5,7 @@
   * :heavy_check_mark: [pthread线程间的Futex同步](docs/futex.md)
   * :heavy_check_mark: [Butex机制：bthread粒度的挂起与唤醒](docs/butex.md)
 * 内存管理
-  * [ResourcePool：多线程下高效的内存分配与回收](docs/resource_pool.md)
+  * :heavy_check_mark: [ResourcePool：多线程下高效的内存分配与回收](docs/resource_pool.md)
   * I/O读写缓冲区
 * 并发读写TCP连接上的数据
   * protobuf编程模式
