@@ -2,6 +2,9 @@
 
 [brpc中Butex的源码解释](#brpc中Butex的源码解释)
 
+官方定义：Provides futex-like semantics which is sequenced wait and wake operations and guaranteed visibilities.
+大概可以理解为是brpc实现的在bthread层面的futex
+
 ## bthread粒度挂起与唤醒的设计原理
 由于bthread任务是在pthread系统线程中执行，在需要bthread间互斥的场景下不能使用pthread级别的锁（如pthread_mutex_lock或者C++的unique_lock等），否则pthread会被挂起，不仅当前的bthread中止执行，pthread私有的TaskGroup的任务队列中其他bthread也无法在该pthread上调度执行。因此需要在应用层实现bthread粒度的互斥机制，一个bthread被挂起时，pthread仍然要保持运行状态，保证TaskGroup任务队列中的其他bthread的正常执行不受影响。
 
@@ -41,8 +44,6 @@ brpc实现bthread互斥的主要代码在src/bthread/butex.cpp中：
    ```c++
    // ButexWaiter是LinkNode的子类，LinkNode里只定义了指向前后节点的指针。
    struct ButexWaiter : public butil::LinkNode<ButexWaiter> {
-       // tids of pthreads are 0
-       // tid就是64位的bthread id。
        // Butex实现了bthread间的挂起&唤醒，也实现了bthread和pthread间的挂起&唤醒，
        // 一个pthread在需要的时候可以挂起，等待适当的时候被一个bthread唤醒，线程挂起不需要tid，填0即可。
        // pthread被bthread唤醒的例子可参考brpc的example目录下的一些client.cpp示例程序，执行main函数的pthread
@@ -60,7 +61,7 @@ brpc实现bthread互斥的主要代码在src/bthread/butex.cpp中：
    struct ButexBthreadWaiter : public ButexWaiter {
        // 执行bthread的TaskMeta结构的指针。
        TaskMeta* task_meta;
-       TimerThread::TaskId sleep_id;
+       TimerThread::TaskId sleep_id; // TODO
        // 状态标记，根据锁变量当前状态是否发生改变，waiter_state会被设为不同的值。
        WaiterState waiter_state;
        // expected_value存储的是当bthread竞争互斥锁失败时锁变量的值，由于从bthread竞争互斥锁失败到bthread挂起
@@ -71,6 +72,7 @@ brpc实现bthread互斥的主要代码在src/bthread/butex.cpp中：
        Butex* initial_butex;
        // 指向全局唯一的TaskControl单例对象的指针。
        TaskControl* control;
+       const timespec* abstime; // TODO
    };
    ```
    
@@ -81,34 +83,28 @@ brpc实现bthread互斥的主要代码在src/bthread/butex.cpp中：
    };
    ```
    
-   以上面的bthread 1获得了互斥锁、bthread 2和bthread 3因等待互斥锁而被挂起的场景为例，Butex的内存布局如下图所示，展现了主要的对象间的内存关系，注意ButexBthreadWaiter变量是分配在bthread的私有栈上的：
+   以上面的bthread 1获得了互斥锁、bthread 2和bthread 3因等待互斥锁而被挂起的场景为例，Butex的内存布局如下图所示，展现了主要的对象间的内存关系，注意ButexBthreadWaiter变量是分配在bthread的私有栈上的：(不画任务函数会好很多，有些杂乱)
    
-   <img src="../images/butex_1.png" width="80%" height="80%"/>
+   <img src="../images/butex_1.png"/>
 
 2. 执行bthread挂起的函数是butex_wait：
 
    ```c++
-    // arg是指向Butex::value锁变量的指针，expected_value是bthread竞争锁失败时锁变量的值。
+    // arg是指向Butex::value锁变量的指针，expected_value是bthread竞争锁失败时锁变量的值, abstime是超市时长
     int butex_wait(void* arg, int expected_value, const timespec* abstime) {
-        // 通过arg定位到Butex对象的地址。
+        // 通过arg定位到Butex对象的地址
         Butex* b = container_of(static_cast<butil::atomic<int>*>(arg), Butex, value);
-        // 如果锁变量当前最新值不等于expected_value，则锁的状态发生了变化，当前bthread不再执行挂起动作，
-        // 直接返回，在外层代码中继续去竞争锁。
+
         if (b->value.load(butil::memory_order_relaxed) != expected_value) {
+            // 如果锁变量当前最新值不等于expected_value, 则锁的状态发生了变化, 直接返回，在外层代码中继续去竞争锁
             errno = EWOULDBLOCK;
-            // Sometimes we may take actions immediately after unmatched butex,
-            // this fence makes sure that we see changes before changing butex.
-            butil::atomic_thread_fence(butil::memory_order_acquire);
             return -1;
         }
-        TaskGroup* g = tls_task_group;
-        if (NULL == g || g->is_current_pthread_task()) {
-            // 当前代码不在bthread中执行而是在直接在pthread上执行，调用butex_wait_from_pthread让pthread挂起。
-            return butex_wait_from_pthread(g, b, expected_value, abstime);
-        }
-        // 创建ButexBthreadWaiter类型的局部变量bbw，bbw是分配在bthread的私有栈空间上的。
+
+        // 忽略了pthread的情况
+
+        // 创建ButexBthreadWaiter类型的局部变量bbw，bbw是分配在bthread的私有栈空间上的
         ButexBthreadWaiter bbw;
-        // tid is 0 iff the thread is non-bthread
         bbw.tid = g->current_tid();
         bbw.container.store(NULL, butil::memory_order_relaxed);
         bbw.task_meta = g->current_task();
@@ -117,59 +113,27 @@ brpc实现bthread互斥的主要代码在src/bthread/butex.cpp中：
         bbw.expected_value = expected_value;
         bbw.initial_butex = b;
         bbw.control = g->control();
+        bbw.abstime = abstime;
 
-        if (abstime != NULL) {
-            // Schedule timer before queueing. If the timer is triggered before
-            // queueing, cancel queueing. This is a kind of optimistic locking.
-            if (butil::timespec_to_microseconds(*abstime) <
-                (butil::gettimeofday_us() + MIN_SLEEP_US)) {
-                // Already timed out.
-                errno = ETIMEDOUT;
-                return -1;
-            }
-            bbw.sleep_id = get_global_timer_thread()->schedule(
-                erase_from_butex_and_wakeup, &bbw, *abstime);
-            if (!bbw.sleep_id) {  // TimerThread stopped.
-                errno = ESTOP;
-                return -1;
-            }
-        }
-    #ifdef SHOW_BTHREAD_BUTEX_WAITER_COUNT_IN_VARS
-        bvar::Adder<int64_t>& num_waiters = butex_waiter_count();
-        num_waiters << 1;
-    #endif
-
-        // release fence matches with acquire fence in interrupt_and_consume_waiters
-        // in task_group.cpp to guarantee visibility of `interrupted'.
-        bbw.task_meta->current_waiter.store(&bbw, butil::memory_order_release);
-        // pthread在执行任务队列中下一个bthread前，会先执行wait_for_butex()将刚创建的bbw对象放入锁的等待队列。
+        // pthread在执行任务队列中下一个bthread前，会先执行wait_for_butex()将刚创建的bbw对象放入锁的等待队列
         g->set_remained(wait_for_butex, &bbw);
-        // 当前bthread yield让出cpu，pthread会从TaskGroup的任务队列中取出下一个bthread去执行。
+        // 当前bthread yield让出cpu，pthread会从TaskGroup的任务队列中取出下一个bthread去执行
         TaskGroup::sched(&g);
 
-        // 这里是butex_wait()恢复执行时的开始执行点。
+        // 这里是butex_wait()恢复执行时的开始执行点, 可能抢到锁, 也可能定时器到了
 
-        // erase_from_butex_and_wakeup (called by TimerThread) is possibly still
-        // running and using bbw. The chance is small, just spin until it's done.
-        BT_LOOP_WHEN(unsleep_if_necessary(&bbw, get_global_timer_thread()) < 0,
-                     30/*nops before sched_yield*/);
-
-        // If current_waiter is NULL, TaskGroup::interrupt() is running and using bbw.
-        // Spin until current_waiter != NULL.
+        // 自旋取消定时器
+        BT_LOOP_WHEN(unsleep_if_necessary(&bbw, get_global_timer_thread()) < 0, 30);
+        
+        // 和TaskGroup::interrupt(只在bthread_interrupt时会触发)相呼应, 自旋等待current_waiter不是NULL
         BT_LOOP_WHEN(bbw.task_meta->current_waiter.exchange(
-                         NULL, butil::memory_order_acquire) == NULL,
-                     30/*nops before sched_yield*/);
-    #ifdef SHOW_BTHREAD_BUTEX_WAITER_COUNT_IN_VARS
-        num_waiters << -1;
-    #endif
+                        NULL, butil::memory_order_acquire) == NULL, 30);
 
         bool is_interrupted = false;
         if (bbw.task_meta->interrupted) {
-            // Race with set and may consume multiple interruptions, which are OK.
             bbw.task_meta->interrupted = false;
             is_interrupted = true;
         }
-        // If timed out as well as value unmatched, return ETIMEDOUT.
         if (WAITER_STATE_TIMEDOUT == bbw.waiter_state) {
             errno = ETIMEDOUT;
             return -1;
@@ -202,6 +166,14 @@ brpc实现bthread互斥的主要代码在src/bthread/butex.cpp中：
                // 将bw加入到锁的等待队列，这才真正完成bthread的挂起，然后直接返回。
                b->waiters.Append(bw);
                bw->container.store(b, butil::memory_order_relaxed);
+               if (bw->abstime != NULL) {
+                   bw->sleep_id = get_global_timer_thread()->schedule(
+                       erase_from_butex_and_wakeup, bw, *bw->abstime);
+                   if (!bw->sleep_id) {  // TimerThread stopped.
+                       errno = ESTOP;
+                       erase_from_butex_and_wakeup(bw);
+                   }
+               }
                return;
            }
        }
@@ -212,7 +184,7 @@ brpc实现bthread互斥的主要代码在src/bthread/butex.cpp中：
        // TaskGroup::interrupt() no-op, there's no race between following code and
        // the two functions. The on-stack ButexBthreadWaiter is safe to use and
        // bw->waiter_state will not change again.
-       unsleep_if_necessary(bw, get_global_timer_thread());
+       // unsleep_if_necessary(bw, get_global_timer_thread());
        // 将bw代表的bthread的tid重新加入TaskGroup的任务队列。
        tls_task_group->ready_to_run(bw->tid);
        // FIXME: jump back to original thread is buggy.
@@ -231,9 +203,8 @@ brpc实现bthread互斥的主要代码在src/bthread/butex.cpp中：
 3. 执行bthread唤醒的函数有butex_wake（唤醒正在等待一个互斥锁的一个bthread）、butex_wake_all（唤醒正在等待一个互斥锁的所有bthread）、butex_wake_except（唤醒正在等待一个互斥锁的除了指定bthread外的其他bthread），下面解释butex_wake的源码：
 
    ```c++
-   // arg是Butex::value锁变量的地址。
    int butex_wake(void* arg) {
-       // 通过arg定位到Butex对象的地址。
+       // arg是Butex::value锁变量的地址, 定位到Butex对象的地址。
        Butex* b = container_of(static_cast<butil::atomic<int>*>(arg), Butex, value);
        ButexWaiter* front = NULL;
        {
@@ -247,19 +218,20 @@ brpc实现bthread互斥的主要代码在src/bthread/butex.cpp中：
            front->RemoveFromList();
            front->container.store(NULL, butil::memory_order_relaxed);
        }
-       if (front->tid == 0) {
-           // ButexWaiter对象的tid=0说明挂起的是pthread系统线程，调用内核提供的系统调用将pthread线程唤醒。
-           wakeup_pthread(static_cast<ButexPthreadWaiter*>(front));
-           return 1;
-       }
+
+       // 忽略了pthread的情况
+
        ButexBthreadWaiter* bbw = static_cast<ButexBthreadWaiter*>(front);
+
+       // 自旋取消定时器
        unsleep_if_necessary(bbw, get_global_timer_thread());
+
        // 将挂起的bthread的tid压入TaskGroup的任务队列，实现了将挂起的bthread唤醒。
-       TaskGroup* g = tls_task_group;
-       if (g) {
-           TaskGroup::exchange(&g, bbw->tid);
+       TaskGroup* g = get_task_group(bbw->control, nosignal);
+       if (g == tls_task_group) {
+           run_in_local_task_group(g, bbw->tid, nosignal);
        } else {
-           bbw->control->choose_one_group()->ready_to_run_remote(bbw->tid);
+           g->ready_to_run_remote(bbw->tid, nosignal);
        }
        return 1;
    }
