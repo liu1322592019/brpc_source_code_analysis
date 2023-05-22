@@ -179,3 +179,8 @@ pthread执行func_1中的swapcontext(&ctx[1], &ctx[2])后，协程1被挂起，c
 - local_storage：用于记录一些bthread运行状态（如各类统计值）等的一块内存。和ContextualStack::storage不能搞混。
 
 - version_butex：指向一个Butex对象头节点的指针。
+
+brpc中的栈切换相关逻辑在 src/bthread/context.cpp(使用的libcontent，使用汇编实现)，核心思路是
+1. 保存当前cpu的一些寄存器的值到当前bthread的栈
+2. 从要切换的bthread的栈中取出寄存器值恢复
+3. 跳转
