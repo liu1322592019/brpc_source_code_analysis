@@ -6,7 +6,7 @@
   * :heavy_check_mark: [Butex机制：bthread粒度的挂起与唤醒](docs/butex.md)
 * 内存管理
   * :heavy_check_mark: [ResourcePool：多线程下高效的内存分配与回收](docs/resource_pool.md)
-  * I/O读写缓冲区
+  * :white_check_mark: [I/O读写缓冲区](docs/io_buf.md)
 * 并发读写TCP连接上的数据
   * protobuf编程模式
   * [多线程向同一TCP连接写入数据](docs/io_write.md)
