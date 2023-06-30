@@ -16,7 +16,7 @@
   * 常用性能监控指标
 * 基础库
   * :white_check_mark: [侵入式双向链表](docs/linkedlist.md)
-  * FlatMap哈希表
+  * :white_check_mark: [FlatMap哈希表](docs/flat_map.md)
   * 多线程框架下的定时器
 * Client端执行流程
   * [无异常状态下的一次完整RPC请求过程](docs/client_rpc_normal.md)
