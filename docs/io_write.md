@@ -86,7 +86,18 @@ int Socket::StartWrite(WriteRequest* req, const WriteOptions& opt) {
         butil::IOBuf* data_arr[1] = { &req->data };
         nw = _conn->CutMessageIntoFileDescriptor(fd(), data_arr, 1);
     } else {
-        nw = req->data.cut_into_file_descriptor(fd());
+#if BRPC_WITH_RDMA
+        // RDMA是一种新的直接内存访问技术，RDMA让计算机可以直接存取其他计算机的内存，而不需要经过处理器的处理.
+        // 听起来很牛逼！
+        if (_rdma_ep && _rdma_state != RDMA_OFF) {
+            butil::IOBuf* data_arr[1] = { &req->data };
+            nw = _rdma_ep->CutFromIOBufList(data_arr, 1);
+        } else {
+#else
+        {
+#endif
+            nw = req->data.cut_into_file_descriptor(fd());
+        }
     }
     if (nw < 0) {
         // RTMP may return EOVERCROWDED
@@ -159,7 +170,7 @@ void* Socket::KeepWrite(void* void_arg) {
             req = req->next;
             s->ReturnSuccessfulWriteRequest(saved_req);
         }
-        // 向fd写入一次数据，DoWrite内部的实现为尽可能的多谢，可以连带req后面的待写数据一起写。
+        // 向fd写入一次数据，DoWrite内部的实现为尽可能的多写，可以连带req后面的待写数据一起写。
         const ssize_t nw = s->DoWrite(req);
         if (nw < 0) {
             if (errno != EAGAIN && errno != EOVERCROWDED) {
@@ -193,23 +204,52 @@ void* Socket::KeepWrite(void* void_arg) {
             // 如果是由于fd的inode输出缓冲区已满导致write操作返回值小于等于0，则需要挂起执行KeepWrite的
             // bthread，让出cpu，让该bthread所在的pthread去任务队列中取出下一个bthread去执行。
             // 等到epoll返回告知inode输出缓冲区有可写空间时，再唤起执行KeepWrite的bthread，继续向fd写入数据。
-            g_vars->nwaitepollout << 1;
-            bool pollin = (s->_on_edge_triggered_events != NULL);
             // NOTE: Waiting epollout within timeout is a must to force
             // KeepWrite to check and setup pending WriteRequests periodically,
             // which may turn on _overcrowded to stop pending requests from
             // growing infinitely.
             const timespec duetime =
                 butil::milliseconds_from_now(WAIT_EPOLLOUT_TIMEOUT_MS);
-            // 在WaitEpollOut内部会执行butex_wait，挂起当前bthread。当bthread重新执行时，执行点是
-            // butex_wait的函数返回点。
-            const int rc = s->WaitEpollOut(s->fd(), pollin, &duetime);
-            if (rc < 0 && errno != ETIMEDOUT) {
-                const int saved_errno = errno;
-                PLOG(WARNING) << "Fail to wait epollout of " << *s;
-                s->SetFailed(saved_errno, "Fail to wait epollout of %s: %s",
+#if BRPC_WITH_RDMA
+            if (s->_rdma_state == RDMA_ON) {
+                const int expected_val = s->_epollout_butex
+                    ->load(butil::memory_order_acquire);
+                CHECK(s->_rdma_ep != NULL);
+                if (!s->_rdma_ep->IsWritable()) {
+                    g_vars->nwaitepollout << 1;
+                    if (bthread::butex_wait(s->_epollout_butex,
+                            expected_val, &duetime) < 0) {
+                        if (errno != EAGAIN && errno != ETIMEDOUT) {
+                            const int saved_errno = errno;
+                            PLOG(WARNING) << "Fail to wait rdma window of " << *s;
+                            s->SetFailed(saved_errno, "Fail to wait rdma window of %s: %s",
+                                    s->description().c_str(), berror(saved_errno));
+                        }
+                        if (s->Failed()) {
+                            // NOTE:
+                            // Different from TCP, we cannot find the RDMA channel
+                            // failed by writing to it. Thus we must check if it
+                            // is already failed here.
+                            break;
+                        }
+                    }
+                }
+            } else {
+#else
+            {
+#endif
+                g_vars->nwaitepollout << 1;
+                bool pollin = (s->_on_edge_triggered_events != NULL);
+                // 在WaitEpollOut内部会执行butex_wait，挂起当前bthread。当bthread重新执行时，执行点是
+                // butex_wait的函数返回点。
+                const int rc = s->WaitEpollOut(s->fd(), pollin, &duetime);
+                if (rc < 0 && errno != ETIMEDOUT) {
+                    const int saved_errno = errno;
+                    PLOG(WARNING) << "Fail to wait epollout of " << *s;
+                    s->SetFailed(saved_errno, "Fail to wait epollout of %s: %s",
                              s->description().c_str(), berror(saved_errno));
-                break;
+                    break;
+                }
             }
         }
         // 令cur_tail找到已翻转链表的尾节点。
@@ -267,7 +307,7 @@ bool Socket::IsWriteComplete(Socket::WriteRequest* old_head,
         return return_when_no_more;
     }
     // 执行到这里，一定是有其他bthread将待写数据加入到了_write_head链表里，
-    // 经过compare_exchange_strong后new_head指向当前_write_head所指的WriteRequest实例，肯定是不等于old_head的。
+    // 经过compare_exchange_strong后new_head指向当前_write_head所指的WriteRequest实例，肯定是不等于old_head的
     CHECK_NE(new_head, old_head);
     // Above acquire fence pairs release fence of exchange in Write() to make
     // sure that we see all fields of requests set.
@@ -294,7 +334,7 @@ bool Socket::IsWriteComplete(Socket::WriteRequest* old_head,
     old_head->next = tail;
     // Call Setup() from oldest to newest, notice that the calling sequence
     // matters for protocols using pipelined_count, this is why we don't
-    // calling Setup in above loop which is from newest to oldest.
+    // call Setup in above loop which is from newest to oldest.
     for (WriteRequest* q = tail; q; q = q->next) {
         q->Setup(this);
     }
@@ -309,7 +349,7 @@ bool Socket::IsWriteComplete(Socket::WriteRequest* old_head,
 ## 一个实际场景下的示例
 下面以一个实际场景为例，说明线程执行过程和内存变化过程：
 
-1. 假设T0时刻有3个分别被不同pthread执行的bthread同时向同一个fd写入数据，3个bthread同时进入到StartWrite函数执行_write_head.exchange原子操作，_write_head初始值是NULL，假设bthread 0第一个用自己的req指针与_write_head做exchange，则bthread 0获取了向fd写数据的权限，bthread 1和bthread 2将待发送的数据加入_write_head链表后直接return 0返回（bthread 1和bthread 2返回后会被挂起，yield让出cpu）。此时内存结构为：
+1. 假设T0时刻有3个分别被不同pthread执行的bthread同时向同一个fd写入数据，3个bthread同时进入到StartWrite函数执行_write_head.exchange原子操作，_write_head初始值是NULL，假设bthread 1第一个用自己的req指针与_write_head做exchange，则bthread 1获取了向fd写数据的权限，bthread 2和bthread 3将待发送的数据加入_write_head链表后直接return 0返回（bthread 2和bthread 3返回后会被挂起，yield让出cpu）。此时内存结构为：
 
    <img src="../images/io_write_linklist_1.png" width="65%" height="65%"/>
 

@@ -1,21 +1,21 @@
 # 目录
 * brpc的M:N线程模型
-  * :heavy_check_mark: [bthread基础](docs/bthread_basis.md)
-  * :heavy_check_mark: [多核环境下pthread调度执行bthread的过程](docs/bthread_schedule.md)
-  * :heavy_check_mark: [pthread线程间的Futex同步](docs/futex.md)
-  * :heavy_check_mark: [Butex机制：bthread粒度的挂起与唤醒](docs/butex.md)
+  * :white_check_mark: [bthread基础](docs/bthread_basis.md)
+  * :white_check_mark: [多核环境下pthread调度执行bthread的过程](docs/bthread_schedule.md)
+  * :white_check_mark: [pthread线程间的Futex同步](docs/futex.md)
+  * :white_check_mark: [Butex机制：bthread粒度的挂起与唤醒](docs/butex.md)
 * 内存管理
-  * :heavy_check_mark: [ResourcePool：多线程下高效的内存分配与回收](docs/resource_pool.md)
-  * :white_check_mark: [I/O读写缓冲区](docs/io_buf.md)
+  * :white_check_mark: [ResourcePool：多线程下高效的内存分配与回收](docs/resource_pool.md)
+  * :heavy_check_mark: [I/O读写缓冲区](docs/io_buf.md)
 * 并发读写TCP连接上的数据
   * protobuf编程模式
-  * [多线程向同一TCP连接写入数据](docs/io_write.md)
-  * [从TCP连接读取数据的并发处理](docs/io_read.md)
+  * :white_check_mark: [多线程向同一TCP连接写入数据](docs/io_write.md)
+  * :white_check_mark: [从TCP连接读取数据的并发处理](docs/io_read.md)
 * brpc的实时监控
   * bvar库
   * 常用性能监控指标
 * 基础库
-  * [侵入式双向链表](docs/linkedlist.md)
+  * :white_check_mark: [侵入式双向链表](docs/linkedlist.md)
   * FlatMap哈希表
   * 多线程框架下的定时器
 * Client端执行流程

@@ -66,7 +66,7 @@ class A : public LinkNode<A> {
 
 A的侵入式链表的内存如下图所示：
 
-<img src="../images/linklist_1.png" width="25%" height="25%"/>
+<img src="../images/linklist_1.png"/>
 
 ## 侵入式链表在brpc中的应用
 Butex锁的等待队列实质上是一个侵入式链表，只需注意每一个ButexWaiter对象都分配在各自bthread的私有栈上，而Butex对象本身分配在heap内存区的ResourcePool中。
