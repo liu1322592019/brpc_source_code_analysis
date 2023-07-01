@@ -5,6 +5,9 @@
 [brpc实现bthread互斥的源码解释](#brpc实现bthread互斥的源码解释)
 
 ## 一次RPC过程中需要bthread互斥的场景
+
+[官方文档](https://github.com/apache/brpc/blob/master/docs/cn/bthread_id.md)
+
 在一次RPC过程中，由于设置RPC超时定时器和开启Backup Request机制，不同的bthread可能会同时操作本次RPC独有的Controller结构，会存在下列几种竞态情况：
 
 1. 第一次Request发出后，在backup_request_ms内未收到响应，触发Backup Request定时器，试图发送Backup Request的同时可能收到了第一次Request的Response，发送Backup Request的bthread和处理Response的bthread需要做互斥；
@@ -22,21 +25,43 @@
 
    brpc会在每一次RPC过程开始阶段创建本次RPC唯一的一个Id对象，用来保护Controller对象，互斥试图 同时访问Controller对象的多个bthread。Id对象主要成员有：
 
+```c++
+    struct BAIDU_CACHELINE_ALIGNMENT Id {
+        // first_ver ~ locked_ver - 1: unlocked versions
+        // locked_ver: locked
+        // unlockable_ver: locked and about to be destroyed
+        // contended_ver: locked and contended
+        uint32_t first_ver;
+        uint32_t locked_ver;
+        internal::FastPthreadMutex mutex;
+        void* data;
+        int (*on_error)(bthread_id_t, void*, int);
+        int (*on_error2)(bthread_id_t, void*, int, const std::string&);
+        const char *lock_location;
+        uint32_t* butex;
+        uint32_t* join_butex;
+        SmallQueue<PendingError, 2> pending_q;
+    };
+```
+
+
    - first_ver & locked_ver
    
-     如果Id对象的butex锁变量的值（butex指针指向的Butex对象的value值）为first_ver，表示Controller对象此时没有bthread在访问。此时如果有一个bthread试图访问Controller对象，则它可以取得访问权，先将butex锁变量的值置为locked_ver后，再去访问Controller对象。
+     - 如果Id对象的butex锁变量的值（butex指针指向的Butex对象的value值）为first_ver，表示Controller对象此时没有bthread在访问。此时如果有一个bthread试图访问Controller对象，则它可以取得访问权，先将butex锁变量的值置为locked_ver后，再去访问Controller对象。
      
-     在locked_ver的基础上又有contended_ver、unlockable_ver、end_ver，contended_ver = locked_ver + 1，unlockable_ver = locked_ver + 2，end_ver = locked_ver + 3。
+     - contended_ver = locked_ver + 1
+       unlockable_ver = locked_ver + 2
+       end_ver = locked_ver + 3。
      
-     contended_ver表示同时访问Controller对象的多个bthread产生了竞态。如果有一个bthread（bthread 1）在访问Controller对象结束后，观察到butex锁变量的值仍为locked_ver，表示没有其他的bthread在等待访问Controller对象，bthread 1在将butex锁变量的值改为first_ver后不会再有其他动作。如果在bthread 1访问Controller对象期间又有bthread 2试图访问Controller对象，bthread 2会观察到butex锁变量的值为locked_ver，bthread 2首先将butex锁变量的值改为contended_ver，意图就是告诉bthread 1产生了竞态。接着bthread 2需要将自身的bthread id等信息存储在butex锁变量的waiters等待队列中，yield让出cpu，让bthread 2所在的pthread去执行TaskGroup任务队列中的下一个bthread任务。当bthread 1完成对Controller对象的访问时，会观察到butex锁变量的值已被改为contended_ver，bthread 1会到waiters队列中找到被挂起的bthread 2的id，通知TaskControl将bthread 2的id压入某一个TaskGroup的任务队列，这就是唤醒了bthread 2。bthread 1唤醒bthread 2后会将butex锁变量的值再次改回first_ver。bthread 2重新被某一个pthread调度执行时，如果这期间没有其他bthread在访问Controller对象，bthread 2会观察到butex锁变量的值为first_ver，这时bthread 2获得了Controller对象的访问权。
+     - `contended_ver`表示同时访问Controller对象的多个bthread产生了竞态。如果有一个bthread（bthread 1）在访问Controller对象结束后，观察到butex锁变量的值仍为locked_ver，表示没有其他的bthread在等待访问Controller对象，bthread 1在将butex锁变量的值改为first_ver后不会再有其他动作。如果在bthread 1访问Controller对象期间又有bthread 2试图访问Controller对象，bthread 2会观察到butex锁变量的值为locked_ver，bthread 2首先将butex锁变量的值改为contended_ver，意图就是告诉bthread 1产生了竞态。接着bthread 2需要将自身的bthread id等信息存储在butex锁变量的waiters等待队列中，yield让出cpu，让bthread 2所在的pthread去执行TaskGroup任务队列中的下一个bthread任务。当bthread 1完成对Controller对象的访问时，会观察到butex锁变量的值已被改为contended_ver，bthread 1会到waiters队列中找到被挂起的bthread 2的id，通知TaskControl将bthread 2的id压入某一个TaskGroup的任务队列，这就是唤醒了bthread 2。bthread 1唤醒bthread 2后会将butex锁变量的值再次改回first_ver。bthread 2重新被某一个pthread调度执行时，如果这期间没有其他bthread在访问Controller对象，bthread 2会观察到butex锁变量的值为first_ver，这时bthread 2获得了Controller对象的访问权。
      
-     unlockable_ver表示RPC即将完成，不允许再有bthread去访问Controller对象了。
+     - `unlockable_ver`表示RPC即将完成，不允许再有bthread去访问Controller对象了。
      
-     end_ver表示一次RPC结束后，Id对象被回收到对象池中后*butex 和 *join_butex的值（butex和join_butex都指向Butex对象的第一个元素value，value是个整型值，所以butex和join_butex可转化为指向整型的指针）。end_ver也是被回收的Id对象再次被分配给某一次RPC过程时的first_ver值。
+     - `end_ver`表示一次RPC结束后，Id对象被回收到对象池中后*butex 和 *join_butex的值（butex和join_butex都指向Butex对象的第一个元素value，value是个整型值，所以butex和join_butex可转化为指向整型的指针）。end_ver也是被回收的Id对象再次被分配给某一次RPC过程时的first_ver值。
      
-     locked_ver的取值和一次RPC的重试次数有关，locked_ver = first_ver + 重试次数 + 2，例如，如果一次RPC过程开始时分配给本次RPC的Id对象的first_ver=1，本次RPC最多允许重试3次，则locked_ver=6，本次RPC的唯一id _correlation_id=1，第一次请求的call_id=2，第一次重试的call_id=3，第二次重试的call_id=4，第三次重试的call_id=5，contended_ver=7，unlockable_ver=8，end_ver=9（_correlation_id和call_id的值只是举例，实际上_correlation_id和call_id都是64bit整型值，前32bit为Id对象在对象池中的slot位移，后32bit为上述的1、2、3...等版本号。服务器返回的Response会回传call_id，通过call_id的前32bit可以在O(1)时间内定位到本次RPC对应的Id对象，方便进行后续的bthread互斥等操作）。
+     - locked_ver的取值和一次RPC的重试次数有关，locked_ver = first_ver + 重试次数 + 2，例如，如果一次RPC过程开始时分配给本次RPC的Id对象的first_ver=1，本次RPC最多允许重试3次，则locked_ver=6，本次RPC的唯一id _correlation_id=1，第一次请求的call_id=2，第一次重试的call_id=3，第二次重试的call_id=4，第三次重试的call_id=5，contended_ver=7，unlockable_ver=8，end_ver=9（_correlation_id和call_id的值只是举例，实际上_correlation_id和call_id都是64bit整型值，前32bit为Id对象在对象池中的slot位移，后32bit为上述的1、2、3...等版本号。服务器返回的Response会回传call_id，通过call_id的前32bit可以在O(1)时间内定位到本次RPC对应的Id对象，方便进行后续的bthread互斥等操作）。
 
-   - mutex
+   - mutex(**原子变量** + **futex**)
    
      类似futex的线程锁，由于试图同时访问同一Controller对象的若干bthread可能在不同的系统线程pthread上被执行，所以bthread在修改Id对象中的字段前需要先做pthread间的互斥。
 
@@ -81,9 +106,9 @@ int bthread_id_lock_and_reset_range_verbose(
     if (!meta) {
         return EINVAL;
     }
-    // id_ver是call_id（一次RPC由于重试等因素可能产生多次call，每个call有其唯一id）。
+    // id_ver是call_id（一次RPC由于重试等因素可能产生多次call，每个call有其唯一id）
     const uint32_t id_ver = bthread::get_version(id);
-    // butex指针指向的是Butex结构的第一个元素：整型变量value，这就是锁变量。
+    // butex指针指向的是Butex结构的第一个元素：整型变量value，这就是锁变量
     uint32_t* butex = meta->butex;
     // 函数的局部变量都是分配在各个bthread的私有栈上的，所以每个bthread看到的不是同一个ever_contended。
     bool ever_contended = false;
@@ -91,7 +116,7 @@ int bthread_id_lock_and_reset_range_verbose(
     meta->mutex.lock();
     while (meta->has_version(id_ver)) {
         if (*butex == meta->first_ver) {
-            // 执行到这里，表示当前没有其他bthread在访问Controller。
+            // 执行到这里，表示当前没有其他bthread在访问Controller
             // contended locker always wakes up the butex at unlock.
             meta->lock_location = location;
             if (range == 0) {
@@ -106,7 +131,7 @@ int bthread_id_lock_and_reset_range_verbose(
                     << ", actually " << range;
             } else {
                 // range的值是“一次RPC的重试次数+2”，
-                // 如果first_ver=1，一次RPC在超时时间内允许重试3次，则locked_ver=6。
+                // 如果first_ver=1，一次RPC在超时时间内允许重试3次，则locked_ver=6
                 meta->locked_ver = meta->first_ver + range;
             }
             // 1、如果是第一个访问Controller的bthread走到这里，则把锁变量的值置为locked_ver；
@@ -171,7 +196,7 @@ int bthread_id_lock_and_reset_range_verbose(
 
 ```c++
 int bthread_id_unlock(bthread_id_t id) {
-    // 通过id的前32bits，在O(1)时间内定位到Id对象的地址。
+    // 通过id的前32bits，在O(1)时间内定位到Id对象的地址
     bthread::Id* const meta = address_resource(bthread::get_slot(id));
     if (!meta) {
         return EINVAL;
@@ -180,7 +205,7 @@ int bthread_id_unlock(bthread_id_t id) {
     // Release fence makes sure all changes made before signal visible to
     // woken-up waiters.
     const uint32_t id_ver = bthread::get_version(id);
-    // 竞争pthread线程锁。
+    // 竞争pthread线程锁
     meta->mutex.lock();
     if (!meta->has_version(id_ver)) {
         // call_id非法，严重错误。
@@ -190,7 +215,7 @@ int bthread_id_unlock(bthread_id_t id) {
     }
     if (*butex == meta->first_ver) {
         // 一个bthread执行到这里，观察到的butex锁变量的当前值要么是locked_ver，要么是contented_ver，
-        // 不可能是first_ver，否则严重错误。
+        // 不可能是first_ver，否则严重错误
         meta->mutex.unlock();
         LOG(FATAL) << "bthread_id=" << id.value << " is not locked!";
         return EPERM;
@@ -199,7 +224,6 @@ int bthread_id_unlock(bthread_id_t id) {
     if (meta->pending_q.pop(&front)) {
         meta->lock_location = front.location;
         meta->mutex.unlock();
-        // 
         if (meta->on_error) {
             return meta->on_error(front.id, meta->data, front.error_code);
         } else {
@@ -207,7 +231,7 @@ int bthread_id_unlock(bthread_id_t id) {
                                    front.error_text);
         }
     } else {
-        // 如果锁变量的当前值为contended_ver，则有N（N>=1）个bthread挂在锁的waiters队列中，等待唤醒。
+        // 如果锁变量的当前值为contended_ver，则有N（N>=1）个bthread挂在锁的waiters队列中，等待唤醒
         const bool contended = (*butex == meta->contended_ver());
         // 重置锁变量的值为first_ver，表示当前的bthread对Controller的独占性访问已完成，后续被唤醒的bthread可以去
         // 竞争对Controller的访问权了。
@@ -216,7 +240,7 @@ int bthread_id_unlock(bthread_id_t id) {
         meta->mutex.unlock();
         if (contended) {
             // We may wake up already-reused id, but that's OK.
-            // 唤醒waiters等待队列中的一个bthread。
+            // 唤醒waiters等待队列中的一个bthread
             bthread::butex_wake(butex);
         }
         return 0; 
@@ -245,8 +269,8 @@ int bthread_id_join(bthread_id_t id) {
         if (!has_ver) {
             break;
         }
-        // 将ButexWaiter挂在join_butex锁的等待队列中，bthread yield让出cpu。
-        // bthread恢复执行的时候，一般是RPC过程已经完成时。
+        // 将ButexWaiter挂在join_butex锁的等待队列中，bthread yield让出cpu
+        // bthread恢复执行的时候，一般是RPC过程已经完成时
         if (bthread::butex_wait(join_butex, expected_ver, NULL) < 0 &&
             errno != EWOULDBLOCK && errno != EINTR) {
             return errno;
