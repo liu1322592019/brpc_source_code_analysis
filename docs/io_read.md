@@ -236,4 +236,7 @@ void* ProcessInputMessage(void* void_arg) {
     return NULL;
 }
 ```
-其中_process是注册协议时注册的函数，例如brpc的是ProcessRpcRequest，里面通过CallMethod调用业务代码
+
+其中_process是注册协议时注册的函数，例如brpc的是
+  - ProcessRpcRequest，里面通过CallMethod调用业务代码
+  - ProcessRpcResponse，填写response并唤醒调用rpc的bthread

@@ -279,3 +279,40 @@ int bthread_id_join(bthread_id_t id) {
     return 0;
 }
 ```
+- bthread_id_unlock_and_destroy：超时或者收到响应的bthread会调该接口，来干掉bthread_id_t, 并唤醒调用rpc的原始bthread
+
+```C++
+int bthread_id_unlock_and_destroy(bthread_id_t id) {
+    bthread::Id* const meta = address_resource(bthread::get_slot(id));
+    if (!meta) {
+        return EINVAL;
+    }
+    uint32_t* butex = meta->butex;
+    uint32_t* join_butex = meta->join_butex;
+    const uint32_t id_ver = bthread::get_version(id);
+    meta->mutex.lock();
+    if (!meta->has_version(id_ver)) {
+        meta->mutex.unlock();
+        LOG(FATAL) << "Invalid bthread_id=" << id.value;
+        return EINVAL;
+    }
+    if (*butex == meta->first_ver) {
+        meta->mutex.unlock();
+        LOG(FATAL) << "bthread_id=" << id.value << " is not locked!";
+        return EPERM;
+    }
+    const uint32_t next_ver = meta->end_ver();
+    *butex = next_ver;
+    *join_butex = next_ver;
+    meta->first_ver = next_ver;
+    meta->locked_ver = next_ver;
+    meta->pending_q.clear();
+    meta->mutex.unlock();
+    // Notice that butex_wake* returns # of woken-up, not successful or not.
+    bthread::butex_wake_except(butex, 0);
+    // 唤醒调用rpc的最原始的bthread
+    bthread::butex_wake_all(join_butex);
+    return_resource(bthread::get_slot(id));
+    return 0;
+}
+```

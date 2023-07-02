@@ -77,11 +77,434 @@
 12. KeepWrite bthread完成工作后，3个请求都被发出，假设服务器正常返回了3个响应，由于3个响应是在一个TCP连接上接收的，所以bthread 4、5二者只会有一个通过epoll_wait()检测到fd可读，并新建一个bthread 7去负责将fd的inode输入缓存中的数据读取到应用层，在拆包过程中，解析出一条Response，就为这个Response的处理再新建一个bthread，目的是实现响应读取+处理的最大并发。因此Response 1在bthread 8中被处理，Response 2在bthread 9中被处理，Response 3在bthread 7中被处理（最后一条Response不需要再新建bthread了，直接在bthread 7本地处理即可）。bthread 8、9、7会将Response 1、2、3分别复制到相应Controller对象的response中，这时应用程序就会看到响应数据了。bthread 8、9、7也会将挂起的bthread 1、2、3唤醒，bthread 1、2、3会恢复执行，可以对Controller对象中的response做一些操作，并开始发送下一个RPC请求。
 
 ## 数据发送代码解析
-// TODO: fixthis
-```C++
-   // Channel::CallMethod
-```
+
+rpc调用函数
 
 ```C++
-   // Controller::IssueRPC
+void Channel::CallMethod(const google::protobuf::MethodDescriptor* method,
+                         google::protobuf::RpcController* controller_base,
+                         const google::protobuf::Message* request,
+                         google::protobuf::Message* response,
+                         google::protobuf::Closure* done) {
+    const int64_t start_send_real_us = butil::gettimeofday_us();
+    Controller* cntl = static_cast<Controller*>(controller_base);
+    cntl->OnRPCBegin(start_send_real_us);
+
+    // 从channel像controller拷贝各种数据
+
+    // Override max_retry first to reset the range of correlation_id
+    if (cntl->max_retry() == UNSET_MAGIC_NUM) {
+        cntl->set_max_retry(_options.max_retry);
+    }
+    if (cntl->max_retry() < 0) {
+        // this is important because #max_retry decides #versions allocated
+        // in correlation_id. negative max_retry causes undefined behavior.
+        cntl->set_max_retry(0);
+    }
+    // HTTP needs this field to be set before any SetFailed()
+    cntl->_request_protocol = _options.protocol;
+    if (_options.protocol.has_param()) {
+        CHECK(cntl->protocol_param().empty());
+        cntl->protocol_param() = _options.protocol.param();
+    }
+    if (_options.protocol == brpc::PROTOCOL_HTTP && (_scheme == "https" || _scheme == "http")) {
+        URI& uri = cntl->http_request().uri();
+        if (uri.host().empty() && !_service_name.empty()) {
+            uri.SetHostAndPort(_service_name);
+        }
+    }
+    cntl->_preferred_index = _preferred_index;
+    cntl->_retry_policy = _options.retry_policy;
+    if (_options.enable_circuit_breaker) {
+        cntl->add_flag(Controller::FLAGS_ENABLED_CIRCUIT_BREAKER);
+    }
+    const CallId correlation_id = cntl->call_id();
+    // 使用cntl前, 上锁，避免不同的bthread同时访问
+    const int rc = bthread_id_lock_and_reset_range(
+                    correlation_id, NULL, 2 + cntl->max_retry());
+    if (rc != 0) {
+        // 理论上进不来这里, 此时不应该有任何的访问
+        CHECK_EQ(EINVAL, rc);
+        if (!cntl->FailedInline()) {
+            cntl->SetFailed(EINVAL, "Fail to lock call_id=%" PRId64,
+                            correlation_id.value);
+        }
+        LOG_IF(ERROR, cntl->is_used_by_rpc())
+            << "Controller=" << cntl << " was used by another RPC before. "
+            "Did you forget to Reset() it before reuse?";
+        // Have to run done in-place. If the done runs in another thread,
+        // Join() on this RPC is no-op and probably ends earlier than running
+        // the callback and releases resources used in the callback.
+        // Since this branch is only entered by wrongly-used RPC, the
+        // potentially introduced deadlock(caused by locking RPC and done with
+        // the same non-recursive lock) is acceptable and removable by fixing
+        // user's code.
+        if (done) {
+            done->Run();
+        }
+        return;
+    }
+    cntl->set_used_by_rpc();
+
+    if (cntl->_sender == NULL && IsTraceable(Span::tls_parent())) {
+        const int64_t start_send_us = butil::cpuwide_time_us();
+        const std::string* method_name = NULL;
+        if (_get_method_name) {
+            method_name = &_get_method_name(method, cntl);
+        } else if (method) {
+            method_name = &method->full_name();
+        } else {
+            const static std::string NULL_METHOD_STR = "null-method";
+            method_name = &NULL_METHOD_STR;
+        }
+        Span* span = Span::CreateClientSpan(
+            *method_name, start_send_real_us - start_send_us);
+        span->set_log_id(cntl->log_id());
+        span->set_base_cid(correlation_id);
+        span->set_protocol(_options.protocol);
+        span->set_start_send_us(start_send_us);
+        cntl->_span = span;
+    }
+    // Override some options if they haven't been set by Controller
+    if (cntl->timeout_ms() == UNSET_MAGIC_NUM) {
+        cntl->set_timeout_ms(_options.timeout_ms);
+    }
+    // Since connection is shared extensively amongst channels and RPC,
+    // overriding connect_timeout_ms does not make sense, just use the
+    // one in ChannelOptions
+    cntl->_connect_timeout_ms = _options.connect_timeout_ms;
+    if (cntl->backup_request_ms() == UNSET_MAGIC_NUM) {
+        cntl->set_backup_request_ms(_options.backup_request_ms);
+    }
+    if (cntl->connection_type() == CONNECTION_TYPE_UNKNOWN) {
+        cntl->set_connection_type(_options.connection_type);
+    }
+    cntl->_response = response;
+    cntl->_done = done;
+    cntl->_pack_request = _pack_request;
+    cntl->_method = method;
+    cntl->_auth = _options.auth;
+
+    if (SingleServer()) {
+        cntl->_single_server_id = _server_id;
+        cntl->_remote_side = _server_address;
+    }
+
+    // Share the lb with controller.
+    cntl->_lb = _lb;
+
+    // Ensure that serialize_request is done before pack_request in all
+    // possible executions, including:
+    //   HandleSendFailed => OnVersionedRPCReturned => IssueRPC(pack_request)
+    // 序列化成为buf, 用于消息发送, brpc为SerializeRequestDefault[brpc/protocol.cpp]
+    _serialize_request(&cntl->_request_buf, cntl, request);
+    if (cntl->FailedInline()) {
+        // Handle failures caused by serialize_request, and these error_codes
+        // should be excluded from the retry_policy.
+        return cntl->HandleSendFailed();
+    }
+    if (FLAGS_usercode_in_pthread &&
+        done != NULL &&
+        TooManyUserCode()) {
+        cntl->SetFailed(ELIMIT, "Too many user code to run when "
+                        "-usercode_in_pthread is on");
+        return cntl->HandleSendFailed();
+    }
+
+    if (cntl->_request_stream != INVALID_STREAM_ID) {
+        // Currently we cannot handle retry and backup request correctly
+        cntl->set_max_retry(0);
+        cntl->set_backup_request_ms(-1);
+    }
+
+    if (cntl->backup_request_ms() >= 0 &&
+        (cntl->backup_request_ms() < cntl->timeout_ms() ||
+         cntl->timeout_ms() < 0)) {
+        // Setup timer for backup request. When it occurs, we'll setup a
+        // timer of timeout_ms before sending backup request.
+
+        // _deadline_us is for truncating _connect_timeout_ms and resetting
+        // timer when EBACKUPREQUEST occurs.
+        if (cntl->timeout_ms() < 0) {
+            cntl->_deadline_us = -1;
+        } else {
+            cntl->_deadline_us = cntl->timeout_ms() * 1000L + start_send_real_us;
+        }
+        // 起个定时器用于超时
+        const int rc = bthread_timer_add(
+            &cntl->_timeout_id,
+            butil::microseconds_to_timespec(
+                cntl->backup_request_ms() * 1000L + start_send_real_us),
+            HandleBackupRequest, (void*)correlation_id.value);
+        if (BAIDU_UNLIKELY(rc != 0)) {
+            cntl->SetFailed(rc, "Fail to add timer for backup request");
+            return cntl->HandleSendFailed();
+        }
+    } else if (cntl->timeout_ms() >= 0) {
+        // Setup timer for RPC timetout
+
+        // _deadline_us is for truncating _connect_timeout_ms
+        cntl->_deadline_us = cntl->timeout_ms() * 1000L + start_send_real_us;
+        // 起个定时器用于超时
+        const int rc = bthread_timer_add(
+            &cntl->_timeout_id,
+            butil::microseconds_to_timespec(cntl->_deadline_us),
+            HandleTimeout, (void*)correlation_id.value);
+        if (BAIDU_UNLIKELY(rc != 0)) {
+            cntl->SetFailed(rc, "Fail to add timer for timeout");
+            return cntl->HandleSendFailed();
+        }
+    } else {
+        cntl->_deadline_us = -1;
+    }
+
+    // 发起RPC调用
+    cntl->IssueRPC(start_send_real_us);
+
+    if (done == NULL) {
+        // MUST wait for response when sending synchronous RPC. It will
+        // be woken up by callback when RPC finishes (succeeds or still
+        // fails after retry)
+        Join(correlation_id);
+        if (cntl->_span) {
+            cntl->SubmitSpan();
+        }
+        cntl->OnRPCEnd(butil::gettimeofday_us());
+    }
+}
 ```
+
+实际处理请求发送
+
+```C++
+void Controller::IssueRPC(int64_t start_realtime_us) {
+    _current_call.begin_time_us = start_realtime_us;
+    
+    // If has retry/backup request，we will recalculate the timeout,
+    if (_real_timeout_ms > 0) {
+        _real_timeout_ms -= (start_realtime_us - _begin_time_us) / 1000;
+    }
+
+    // Clear last error, Don't clear _error_text because we append to it.
+    _error_code = 0;
+
+    // Make versioned correlation_id.
+    // call_id         : unversioned, mainly for ECANCELED and ERPCTIMEDOUT
+    // call_id + 1     : first try.
+    // call_id + 2     : retry 1
+    // ...
+    // call_id + N + 1 : retry N
+    // All ids except call_id are versioned. Say if we've sent retry 1 and
+    // a failed response of first try comes back, it will be ignored.
+    const CallId cid = current_id();
+
+    // Intercept IssueRPC when _sender is set. Currently _sender is only set
+    // by SelectiveChannel.
+    if (_sender) {
+        if (_sender->IssueRPC(start_realtime_us) != 0) {
+            return HandleSendFailed();
+        }
+        CHECK_EQ(0, bthread_id_unlock(cid));
+        return;
+    }
+
+    // 根据指定的负载均衡策略选择服务端
+    // Pick a target server for sending RPC
+    _current_call.need_feedback = false;
+    _current_call.enable_circuit_breaker = has_enabled_circuit_breaker();
+    SocketUniquePtr tmp_sock;
+    if (SingleServer()) {
+        // Don't use _current_call.peer_id which is set to -1 after construction
+        // of the backup call.
+        const int rc = Socket::Address(_single_server_id, &tmp_sock);
+        if (rc != 0 || (!is_health_check_call() && !tmp_sock->IsAvailable())) {
+            SetFailed(EHOSTDOWN, "Not connected to %s yet, server_id=%" PRIu64,
+                      endpoint2str(_remote_side).c_str(), _single_server_id);
+            tmp_sock.reset();  // Release ref ASAP
+            return HandleSendFailed();
+        }
+        _current_call.peer_id = _single_server_id;
+    } else {
+        LoadBalancer::SelectIn sel_in =
+            { start_realtime_us, true,
+              has_request_code(), _request_code, _accessed };
+        LoadBalancer::SelectOut sel_out(&tmp_sock);
+        const int rc = _lb->SelectServer(sel_in, &sel_out);
+        if (rc != 0) {
+            std::ostringstream os;
+            DescribeOptions opt;
+            opt.verbose = false;
+            _lb->Describe(os, opt);
+            SetFailed(rc, "Fail to select server from %s", os.str().c_str());
+            return HandleSendFailed();
+        }
+        _current_call.need_feedback = sel_out.need_feedback;
+        _current_call.peer_id = tmp_sock->id();
+        // NOTE: _remote_side must be set here because _pack_request below
+        // may need it (e.g. http may set "Host" to _remote_side)
+        // Don't set _local_side here because tmp_sock may be not connected
+        // here.
+        _remote_side = tmp_sock->remote_side();
+    }
+    if (_stream_creator) {
+        _current_call.stream_user_data =
+            _stream_creator->OnCreatingStream(&tmp_sock, this);
+        if (FailedInline()) {
+            return HandleSendFailed();
+        }
+        // remote_side can't be changed.
+        CHECK_EQ(_remote_side, tmp_sock->remote_side());
+    }
+
+    Span* span = _span;
+    if (span) {
+        if (_current_call.nretry == 0) {
+            span->set_remote_side(_remote_side);
+        } else {
+            span->Annotate("Retrying %s",
+                           endpoint2str(_remote_side).c_str());
+        }
+    }
+    // 根据类型处理或获取TCP连接
+    // Handle connection type
+    if (_connection_type == CONNECTION_TYPE_SINGLE ||
+        _stream_creator != NULL) { // let user decides the sending_sock
+        // in the callback(according to connection_type) directly
+        _current_call.sending_sock.reset(tmp_sock.release());
+        // TODO(gejun): Setting preferred index of single-connected socket
+        // has two issues:
+        //   1. race conditions. If a set perferred_index is overwritten by
+        //      another thread, the response back has to check protocols one
+        //      by one. This is a performance issue, correctness is unaffected.
+        //   2. thrashing between different protocols. Also a performance issue.
+        _current_call.sending_sock->set_preferred_index(_preferred_index);
+    } else {
+        int rc = 0;
+        if (_connection_type == CONNECTION_TYPE_POOLED) {
+            rc = tmp_sock->GetPooledSocket(&_current_call.sending_sock);
+        } else if (_connection_type == CONNECTION_TYPE_SHORT) {
+            rc = tmp_sock->GetShortSocket(&_current_call.sending_sock);
+        } else {
+            tmp_sock.reset();
+            SetFailed(EINVAL, "Invalid connection_type=%d", (int)_connection_type);
+            return HandleSendFailed();
+        }
+        if (rc) {
+            tmp_sock.reset();
+            SetFailed(rc, "Fail to get %s connection",
+                      ConnectionTypeToString(_connection_type));
+            return HandleSendFailed();
+        }
+        // Remember the preferred protocol for non-single connection. When
+        // the response comes back, InputMessenger calls the right handler
+        // w/o trying other protocols. This is a must for (many) protocols that
+        // can't be distinguished from other protocols w/o ambiguity.
+        _current_call.sending_sock->set_preferred_index(_preferred_index);
+        // Set preferred_index of main_socket as well to make it easier to
+        // debug and observe from /connections.
+        if (tmp_sock->preferred_index() < 0) {
+            tmp_sock->set_preferred_index(_preferred_index);
+        }
+        tmp_sock.reset();
+    }
+    if (_tos > 0) {
+        _current_call.sending_sock->set_type_of_service(_tos);
+    }
+    if (is_response_read_progressively()) {
+        // Tag the socket so that when the response comes back, the parser will
+        // stop before reading all body.
+        _current_call.sending_sock->read_will_be_progressive(_connection_type);
+    }
+
+    // Handle authentication
+    const Authenticator* using_auth = NULL;
+    if (_auth != NULL) {
+        // Only one thread will be the winner and get the right to pack
+        // authentication information, others wait until the request
+        // is sent.
+        int auth_error = 0;
+        if (_current_call.sending_sock->FightAuthentication(&auth_error) == 0) {
+            using_auth = _auth;
+        } else if (auth_error != 0) {
+            SetFailed(auth_error, "Fail to authenticate, %s",
+                      berror(auth_error));
+            return HandleSendFailed();
+        }
+    }
+    // Make request
+    butil::IOBuf packet;
+    SocketMessage* user_packet = NULL;
+    _pack_request(&packet, &user_packet, cid.value, _method, this,
+                  _request_buf, using_auth);
+    // TODO: PackRequest may accept SocketMessagePtr<>?
+    SocketMessagePtr<> user_packet_guard(user_packet);
+    if (FailedInline()) {
+        // controller should already be SetFailed.
+        if (using_auth) {
+            // Don't forget to signal waiters on authentication
+            _current_call.sending_sock->SetAuthentication(ErrorCode());
+        }
+        return HandleSendFailed();
+    }
+
+    timespec connect_abstime;
+    timespec* pabstime = NULL;
+    if (_connect_timeout_ms > 0) {
+        if (_deadline_us >= 0) {
+            connect_abstime = butil::microseconds_to_timespec(
+                std::min(_connect_timeout_ms * 1000L + start_realtime_us,
+                         _deadline_us));
+        } else {
+            connect_abstime = butil::microseconds_to_timespec(
+                _connect_timeout_ms * 1000L + start_realtime_us);
+        }
+        pabstime = &connect_abstime;
+    }
+
+    // Write会调用StartWrite写入数据到TCP，实际发送
+    Socket::WriteOptions wopt;
+    wopt.id_wait = cid;
+    wopt.abstime = pabstime;
+    wopt.pipelined_count = _pipelined_count;
+    wopt.auth_flags = _auth_flags;
+    wopt.ignore_eovercrowded = has_flag(FLAGS_IGNORE_EOVERCROWDED);
+    int rc;
+    size_t packet_size = 0;
+    if (user_packet_guard) {
+        if (span) {
+            packet_size = user_packet_guard->EstimatedByteSize();
+        }
+        rc = _current_call.sending_sock->Write(user_packet_guard, &wopt);
+    } else {
+        packet_size = packet.size();
+        rc = _current_call.sending_sock->Write(&packet, &wopt);
+    }
+    if (span) {
+        if (_current_call.nretry == 0) {
+            span->set_sent_us(butil::cpuwide_time_us());
+            span->set_request_size(packet_size);
+        } else {
+            span->Annotate("Requested(%lld) [%d]",
+                           (long long)packet_size, _current_call.nretry + 1);
+        }
+    }
+    if (using_auth) {
+        // For performance concern, we set authentication to immediately
+        // after the first `Write' returns instead of waiting for server
+        // to confirm the credential data
+        _current_call.sending_sock->SetAuthentication(rc);
+    }
+
+    // 解除对bthread_id_t的锁，确保收到响应时可以唤起
+    CHECK_EQ(0, bthread_id_unlock(cid));
+}
+```
+
+收到响应后, 主要调用栈如下
+ - ProcessRpcResponse
+   - ControllerPrivateAccessor::OnResponse
+      - Controller::OnVersionedRPCReturned
+         - bthread_id_about_to_destroy
+         - EndRPC
+            - bthread_timer_del
+            - bthread_id_unlock_and_destroy - 唤醒调用rpc的bthread 
