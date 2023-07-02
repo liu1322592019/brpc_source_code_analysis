@@ -8,7 +8,7 @@
   * :white_check_mark: [ResourcePool：多线程下高效的内存分配与回收](docs/resource_pool.md)
   * :heavy_check_mark: [I/O读写缓冲区](docs/io_buf.md)
 * 并发读写TCP连接上的数据
-  * protobuf编程模式
+  * [protobuf编程模式](docs/protobuf.md)
   * :white_check_mark: [多线程向同一TCP连接写入数据](docs/io_write.md)
   * :white_check_mark: [从TCP连接读取数据的并发处理](docs/io_read.md)
 * brpc的实时监控
@@ -20,7 +20,7 @@
   * 多线程框架下的定时器
 * Client端执行流程
   * :white_check_mark: [同一RPC过程中各个bthread间的互斥](docs/client_bthread_sync.md)
-  * [无异常状态下的一次完整RPC请求过程](docs/client_rpc_normal.md)
+  * :heavy_check_mark: [无异常状态下的一次完整RPC请求过程](docs/client_rpc_normal.md)
   * [RPC请求可能遇到的多种异常及应对策略](docs/client_rpc_exception.md)
   * 重试&Backup Request
 * Server端执行流程
