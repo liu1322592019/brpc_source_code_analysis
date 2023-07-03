@@ -6,7 +6,7 @@
   * :white_check_mark: [Butex机制：bthread粒度的挂起与唤醒](docs/butex.md)
 * 内存管理
   * :white_check_mark: [ResourcePool：多线程下高效的内存分配与回收](docs/resource_pool.md)
-  * :heavy_check_mark: [I/O读写缓冲区](docs/io_buf.md)
+  * :white_check_mark: [I/O读写缓冲区](docs/io_buf.md)
 * butil基础库
   * :white_check_mark: [侵入式双向链表](docs/linkedlist.md)
   * :white_check_mark: [FlatMap哈希表](docs/flat_map.md)
