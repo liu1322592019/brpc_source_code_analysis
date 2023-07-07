@@ -21,8 +21,8 @@
 * Client端执行流程
   * :white_check_mark: [同一RPC过程中各个bthread间的互斥](docs/client_bthread_sync.md)
   * :white_check_mark: [无异常状态下的一次完整RPC请求过程](docs/client_rpc_normal.md)
-  * [RPC请求可能遇到的多种异常及应对策略](docs/client_rpc_exception.md)
-  * 重试&Backup Request
+  * :white_check_mark: [RPC请求可能遇到的多种异常及应对策略](docs/client_rpc_exception.md)
+  * :white_check_mark: [重试&Backup Request](docs/client_retry_backup.md)
 * Server端执行流程
   * 处理一次RPC请求的完整过程
   * 服务器自动限流
