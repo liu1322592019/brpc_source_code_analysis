@@ -24,6 +24,5 @@
   * :white_check_mark: [RPC请求可能遇到的多种异常及应对策略](docs/client_rpc_exception.md)
   * :white_check_mark: [重试&Backup Request](docs/client_retry_backup.md)
 * Server端执行流程
-  * 处理一次RPC请求的完整过程
-  * 服务器自动限流
-  * 防雪崩
+  * :white_check_mark: [处理一次RPC请求的完整过程](docs/server_rpc_normal.md)
+  * :white_check_mark: [服务器自动限流&防雪崩](docs/server_rpc_limit.md)
